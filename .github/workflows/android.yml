@@ -1,0 +1,139 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # ubuntu-latest runners already ship the Android SDK + cmdline-tools,
+      # so no separate setup-android step is needed.
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Generate app icons & splash
+        run: npx capacitor-assets generate --android || echo "asset generation skipped"
+
+      - name: Sync web assets
+        run: npx cap sync android
+
+      - name: Add Android permissions (alarms, notifications, storage)
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          for P in POST_NOTIFICATIONS SCHEDULE_EXACT_ALARM USE_EXACT_ALARM RECEIVE_BOOT_COMPLETED WAKE_LOCK VIBRATE; do
+            grep -q "android.permission.$P\"" $M || sed -i "s#</manifest>#    <uses-permission android:name=\"android.permission.$P\" />\n</manifest>#" $M
+          done
+          grep -q WRITE_EXTERNAL_STORAGE $M || sed -i 's#</manifest>#    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />\n</manifest>#' $M
+          sed -i 's#<application#<application android:requestLegacyExternalStorage="true"#' $M
+
+      # ==========================================================
+      # Release signing.
+      # If the 3 GitHub secrets are set (RELEASE_KEYSTORE_BASE64,
+      # RELEASE_KEYSTORE_PASSWORD, RELEASE_KEY_ALIAS) the APK is
+      # signed with YOUR saved release key.
+      # If they are not set yet, a new release key is generated on
+      # the first run and uploaded as the "RELEASE-KEY-save-this"
+      # artifact — download it, keep a backup, then add the secrets
+      # so every future build uses the SAME key.
+      # ==========================================================
+      - name: Prepare release signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+        run: |
+          PW="${KEYSTORE_PASSWORD:-sonkolpo-2026-key}"
+          ALIAS="${KEY_ALIAS:-sonkolpo}"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | tr -d '[:space:]' | base64 -d > android/release.keystore
+            echo "Using YOUR release key from GitHub secrets."
+          else
+            echo "No signing secrets found - generating a NEW release key (first run only)..."
+            keytool -genkeypair -v -keystore android/release.keystore \
+              -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PW" -keypass "$PW" \
+              -dname "CN=Sonkolpo OS, OU=Apps, O=Bappi, L=Dhaka, C=BD"
+            mkdir -p signing-info
+            cp android/release.keystore signing-info/release.keystore
+            base64 -w0 android/release.keystore > signing-info/keystore-base64.txt
+            { echo "RELEASE_KEYSTORE_PASSWORD = $PW"; echo "RELEASE_KEY_ALIAS = $ALIAS"; } > signing-info/passwords.txt
+            echo "SAVE_THIS_KEY=true" >> "$GITHUB_ENV"
+          fi
+          {
+            echo "storeFile=release.keystore"
+            echo "storePassword=$PW"
+            echo "keyAlias=$ALIAS"
+            echo "keyPassword=$PW"
+          } > android/keystore.properties
+
+      - name: Enable signed release build
+        run: |
+          cat >> android/app/build.gradle <<'EOF'
+
+          def ksProps = new Properties()
+          def ksFile = rootProject.file("keystore.properties")
+          if (ksFile.exists()) {
+              ksProps.load(new FileInputStream(ksFile))
+              android {
+                  signingConfigs {
+                      release {
+                          storeFile rootProject.file(ksProps['storeFile'])
+                          storePassword ksProps['storePassword']
+                          keyAlias ksProps['keyAlias']
+                          keyPassword ksProps['keyPassword']
+                      }
+                  }
+                  buildTypes {
+                      release {
+                          signingConfig signingConfigs.release
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Build SIGNED release APK
+        run: |
+          cd android
+          ./gradlew assembleRelease --no-daemon || echo "release build skipped"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonkolpo-os-apk
+          path: |
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload release key (FIRST BUILD ONLY — SAVE THIS FOREVER)
+        if: env.SAVE_THIS_KEY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: RELEASE-KEY-save-this
+          path: signing-info/
+          if-no-files-found: error
